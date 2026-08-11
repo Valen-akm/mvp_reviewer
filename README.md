@@ -193,6 +193,7 @@ MVP 暂时不引入 open·kritt 的数据库、分布式 worker、Web UI、任�
 
 | 方法论概念 | 当前实现 |
 | --- | --- |
+| GitHub PR URL 解析和临时仓库准备 | `github_pr.py` |
 | 固定 Git 范围和隔离快照 | `git_diff.py` |
 | Unit、Flow、Mission、Finding、RootCause 数据契约 | `models.py`、`schemas/*.json` |
 | Unit/Flow/Review/Verification/Aggregation prompts | `prompts.py` |
@@ -262,10 +263,28 @@ PR #125 可以作为早期基准样本：旧流程产生约 15 条最终 finding
 - POSIX 平台（Linux 或 macOS）
 - Git
 - 已安装并认证的 `codex` CLI 0.147.0 或更高版本
-- 自包含的 Git object database
+- 公共 PR，或能够访问私有仓库的 Git/GitHub 凭据
 - 当前 MVP 不支持 changed submodule gitlink
 
-本地运行只适用于你信任的目标仓库：
+最简单的使用方式是直接传入 GitHub PR 链接：
+
+```bash
+python3 -m mvp_reviewer \
+  --pr https://github.com/EvoseAI/api.tiwork.ai/pull/125 \
+  --trusted-target
+```
+
+程序会从 GitHub API 固定该 PR 的 base/head commit，临时克隆 base repository，再获取
+`refs/pull/<number>/head`。准备阶段不会 checkout PR 文件；审查结束后会自动删除临时仓库。完整进度会打印到终端，
+报告默认写入：
+
+- `codex-review-output/findings.json`
+- `codex-review-output/review.md`
+
+私有仓库需要设置 `GITHUB_TOKEN` 供 GitHub API 使用，同时为 `git clone` 配置可用的 Git credential helper。
+当前只接受规范形式的 `https://github.com/<owner>/<repo>/pull/<number>` 链接。
+
+需要审查已有本地仓库时，仍可显式指定 repository 和 base：
 
 ```bash
 python3 -m mvp_reviewer \
@@ -280,12 +299,8 @@ python3 -m mvp_reviewer \
   --trusted-target
 ```
 
-默认输出：
-
-- `codex-review-output/findings.json`
-- `codex-review-output/review.md`
-
-CLI 会审查固定 HEAD 的临时 detached clone，不包含未提交的 working-tree 改动。
+两种模式都会审查固定 HEAD 的隔离快照，不包含本地未提交的 working-tree 改动。`--pr` 不能与 `--repo` 或
+`--base` 同时使用。
 
 ### 退出码
 

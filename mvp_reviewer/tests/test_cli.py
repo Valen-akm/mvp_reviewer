@@ -10,6 +10,7 @@ from mvp_reviewer.__main__ import (
     EXIT_SUCCESS,
     gate_exit_code,
     main,
+    parse_args,
 )
 from mvp_reviewer.models import Finding, ReviewResult, RootCause
 
@@ -94,6 +95,23 @@ class DeliveryGateTest(unittest.TestCase):
 
 
 class CliIntegrationTest(unittest.TestCase):
+    def test_pr_mode_requires_no_repo_or_base_argument(self) -> None:
+        args = parse_args(["--pr", "https://github.com/EvoseAI/api.tiwork.ai/pull/125"])
+
+        self.assertEqual(args.pr, "https://github.com/EvoseAI/api.tiwork.ai/pull/125")
+        self.assertIsNone(args.repo)
+        self.assertIsNone(args.base)
+
+    def test_local_mode_still_requires_base(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(["--repo", "/tmp/example"])
+
+    def test_pr_mode_rejects_repo_or_base_override(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(["--pr", "https://github.com/EvoseAI/api.tiwork.ai/pull/125", "--repo", "/tmp/example"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--pr", "https://github.com/EvoseAI/api.tiwork.ai/pull/125", "--base", "main"])
+
     def test_empty_diff_completes_without_invoking_codex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

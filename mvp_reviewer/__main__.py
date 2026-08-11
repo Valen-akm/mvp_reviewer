@@ -2,10 +2,13 @@ import argparse
 import asyncio
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from mvp_reviewer.codex_runner import CodexExecutionError, CodexRunner
 from mvp_reviewer.git_diff import DiffScope, GitError, collect_diff_scope, review_snapshot
+from mvp_reviewer.github_pr import PullRequestError, prepare_github_pr
 from mvp_reviewer.models import ReviewResult
 from mvp_reviewer.pipeline import PipelineError, ReviewPipeline
 from mvp_reviewer.report import write_error_report, write_report
@@ -30,10 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m mvp_reviewer",
         description="Run staged, high-signal code review passes with Codex CLI.",
     )
-    parser.add_argument(
-        "--repo", type=Path, default=Path.cwd(), help="Git repository to review (default: current directory)"
-    )
-    parser.add_argument("--base", required=True, help="Base branch or commit, for example origin/main")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--pr", help="Canonical GitHub pull request URL")
+    source.add_argument("--repo", type=Path, help="Local Git repository to review (default: current directory)")
+    parser.add_argument("--base", help="Base branch or commit for local repository mode, for example origin/main")
     parser.add_argument(
         "--output",
         type=Path,
@@ -67,9 +70,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trusted-target",
         action="store_true",
-        help="Acknowledge that a local review target is trusted to run agent shell commands",
+        help="Acknowledge that the review target is trusted to run agent shell commands",
     )
     return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and validate the two supported review source modes."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.pr:
+        if args.base is not None:
+            parser.error("--base cannot be used with --pr")
+    else:
+        if args.base is None:
+            parser.error("--base is required unless --pr is used")
+        if args.repo is None:
+            args.repo = Path.cwd()
+    return args
 
 
 def gate_exit_code(result: ReviewResult, *, fail_on: str, require_complete: bool) -> int:
@@ -90,22 +108,23 @@ def gate_exit_code(result: ReviewResult, *, fail_on: str, require_complete: bool
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     try:
         if not args.trusted_target and os.environ.get("OPEN_KRITT_EPHEMERAL_RUNNER") != "true":
             raise ValueError(
                 "untrusted review targets require the ephemeral GitHub-hosted workflow; "
                 "pass --trusted-target only for repositories you trust"
             )
-        scope = collect_diff_scope(args.repo, args.base)
-        print(f"Reviewing {len(scope.files)} changed files at {scope.head}", file=sys.stderr)
-        if scope.files:
-            with review_snapshot(scope) as snapshot:
-                result = _run_pipeline(scope, snapshot, args)
-        else:
-            result = _run_pipeline(scope, scope.repo, args)
+        with _review_source(args) as (repo, base):
+            scope = collect_diff_scope(repo, base)
+            print(f"Reviewing {len(scope.files)} changed files at {scope.head}", file=sys.stderr)
+            if scope.files:
+                with review_snapshot(scope) as snapshot:
+                    result = _run_pipeline(scope, snapshot, args)
+            else:
+                result = _run_pipeline(scope, scope.repo, args)
         json_path, markdown_path = write_report(result, args.output)
-    except (CodexExecutionError, GitError, OSError, PipelineError, ValueError) as exc:
+    except (CodexExecutionError, GitError, OSError, PipelineError, PullRequestError, ValueError) as exc:
         print(f"review failed: {exc}", file=sys.stderr)
         try:
             json_path, markdown_path = write_error_report(str(exc), args.output)
@@ -128,6 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     elif exit_code == EXIT_FINDINGS:
         print(f"Review gate failed on {args.fail_on} or higher findings.", file=sys.stderr)
     return exit_code
+
+
+@contextmanager
+def _review_source(args: argparse.Namespace) -> Iterator[tuple[Path, str]]:
+    if args.pr:
+        with prepare_github_pr(
+            args.pr,
+            on_progress=lambda message: print(message, file=sys.stderr, flush=True),
+        ) as target:
+            yield target.repo, target.base
+        return
+    yield args.repo, args.base
 
 
 def _run_pipeline(scope: DiffScope, repo: Path, args: argparse.Namespace) -> ReviewResult:
