@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "review_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string", "minLength": 1 },
+          "changed_files": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "review_focus": { "type": "string", "minLength": 1 }
+        },
+        "required": ["label", "changed_files", "review_focus"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["review_units"],
+  "additionalProperties": false
+}

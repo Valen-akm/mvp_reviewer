@@ -1,0 +1,270 @@
+name: Codex PR Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Ref to review; leave empty for the default branch
+        required: false
+        type: string
+      base:
+        description: Base branch or commit
+        required: true
+        default: origin/main
+        type: string
+      fail_on:
+        description: Minimum confirmed severity that fails the review
+        required: true
+        default: high
+        type: choice
+        options: [none, medium, high, critical]
+      require_complete:
+        description: Fail when any Codex task is incomplete
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: codex-review-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: staged review
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.CODEX_REVIEW_ENABLED == 'true' &&
+       github.event.pull_request.draft == false &&
+       github.event.pull_request.user.type != 'Bot' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      exit_code: ${{ steps.resolve-review.outputs.exit_code }}
+    env:
+      OPEN_KRITT_EPHEMERAL_RUNNER: 'true'
+      REVIEW_OUTPUT: ${{ github.workspace }}/codex-review-output
+      REVIEW_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base }}
+      REVIEW_FAIL_ON: ${{ github.event_name == 'pull_request' && 'high' || inputs.fail_on }}
+      REVIEW_REQUIRE_COMPLETE: ${{ github.event_name == 'pull_request' && 'true' || inputs.require_complete }}
+      REVIEW_CACHE_KEY: >-
+        codex-review-v3-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Restore an unchanged review range
+        id: restore-review
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.action == 'edited' &&
+          github.event.changes.base == null
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.REVIEW_OUTPUT }}
+          key: ${{ env.REVIEW_CACHE_KEY }}
+
+      - name: Check out the trusted reviewer
+        if: steps.restore-review.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: >-
+            ${{ github.event_name == 'pull_request' &&
+                github.event.pull_request.base.sha ||
+                github.event.repository.default_branch }}
+          path: reviewer-tool
+          persist-credentials: false
+
+      - name: Check out the untrusted review target
+        if: steps.restore-review.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.ref }}
+          fetch-depth: 0
+          path: review-target
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        if: steps.restore-review.outputs.cache-hit != 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Configure a read-only Codex runtime
+        if: steps.restore-review.outputs.cache-hit != 'true'
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: 0.147.0
+          safety-strategy: drop-sudo
+          working-directory: review-target
+
+      - name: Run staged review
+        id: run-review
+        if: steps.restore-review.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          review_args=()
+          if [[ "$REVIEW_REQUIRE_COMPLETE" == "true" ]]; then
+            review_args+=(--require-complete)
+          fi
+
+          set +e
+          cd reviewer-tool
+          python -m mvp_reviewer \
+            --repo ../review-target \
+            --base "$REVIEW_BASE" \
+            --output "$REVIEW_OUTPUT" \
+            --timeout-seconds 600 \
+            --fail-on "$REVIEW_FAIL_ON" \
+            "${review_args[@]}"
+          review_status=$?
+          set -e
+
+          printf '%s\n' "$review_status" > "$REVIEW_OUTPUT/exit-code"
+          echo "exit_code=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the completed review range
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.restore-review.outputs.cache-hit != 'true' &&
+          (steps.run-review.outputs.exit_code == '0' || steps.run-review.outputs.exit_code == '1')
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.REVIEW_OUTPUT }}
+          key: ${{ env.REVIEW_CACHE_KEY }}
+
+      - name: Resolve review status
+        id: resolve-review
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.restore-review.outputs.cache-hit }}
+          RUN_EXIT_CODE: ${{ steps.run-review.outputs.exit_code }}
+        shell: bash
+        run: |
+          review_status="$RUN_EXIT_CODE"
+          if [[ "$CACHE_HIT" == "true" ]]; then
+            review_status=$(<"$REVIEW_OUTPUT/exit-code")
+          fi
+          case "$review_status" in
+            0|1|2) ;;
+            *) review_status=2 ;;
+          esac
+          echo "exit_code=$review_status" >> "$GITHUB_OUTPUT"
+
+      - name: Publish job summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$REVIEW_OUTPUT/review.md" ]]; then
+            cat "$REVIEW_OUTPUT/review.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Codex Code Review" >> "$GITHUB_STEP_SUMMARY"
+            echo "Review failed before a report could be written." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload review artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-review-${{ github.run_id }}
+          path: codex-review-output/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce review gate
+        if: always()
+        env:
+          REVIEW_EXIT_CODE: ${{ steps.resolve-review.outputs.exit_code }}
+        shell: bash
+        run: |
+          case "$REVIEW_EXIT_CODE" in
+            0) exit 0 ;;
+            1) echo "Confirmed findings met the configured severity gate." >&2; exit 1 ;;
+            2) echo "The review did not complete successfully." >&2; exit 2 ;;
+            *) echo "The review did not produce a valid exit code." >&2; exit 2 ;;
+          esac
+
+  publish-comment:
+    name: publish PR comment
+    needs: review
+    if: >-
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      (needs.review.result == 'success' || needs.review.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # Required only to create or update the review comment.
+    steps:
+      - name: Download review artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        continue-on-error: true
+        with:
+          name: codex-review-${{ github.run_id }}
+          path: codex-review-output
+
+      - name: Create or update review comment
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          REVIEW_PATH: codex-review-output/review.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- open-kritt-codex-review -->';
+            const reviewedHead = context.payload.pull_request.head.sha;
+            const reviewedBase = context.payload.pull_request.base.sha;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (pullRequest.head.sha !== reviewedHead || pullRequest.base.sha !== reviewedBase) {
+              core.info(
+                `Skipping stale review for ${reviewedBase}..${reviewedHead}; ` +
+                `current range is ${pullRequest.base.sha}..${pullRequest.head.sha}.`,
+              );
+              return;
+            }
+            const hasReport = fs.existsSync(process.env.REVIEW_PATH);
+            const report = hasReport
+              ? fs.readFileSync(process.env.REVIEW_PATH, 'utf8')
+              : '# Codex Code Review\n\n> Review failed before a report could be written.';
+            const suffix = hasReport
+              ? `\n\nReviewed range: \`${reviewedBase}..${reviewedHead}\`. Full JSON and Markdown reports are attached to the workflow run.`
+              : `\n\nReviewed range: \`${reviewedBase}..${reviewedHead}\`. See the workflow logs for the operational failure.`;
+            const safeReport = report.replaceAll('@', '@\u200b');
+            const body = `${marker}\n${safeReport.slice(0, 60000)}${suffix}`;
+            let existing;
+            const pages = github.paginate.iterator(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            for await (const response of pages) {
+              existing = response.data.find(
+                (comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker),
+              );
+              if (existing) break;
+            }
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

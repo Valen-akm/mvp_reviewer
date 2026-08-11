@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "category": {
+      "type": "string",
+      "enum": ["security", "performance", "correctness"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low"]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "file_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "line": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "explanation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "suggested_fix": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verification": {
+      "type": "string",
+      "minLength": 1
+    },
+    "confirmed": {
+      "type": "boolean"
+    },
+    "introduced_by_diff": {
+      "type": "boolean"
+    },
+    "actionable": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "category",
+    "severity",
+    "confidence",
+    "file_path",
+    "line",
+    "summary",
+    "explanation",
+    "evidence",
+    "suggested_fix",
+    "verification",
+    "confirmed",
+    "introduced_by_diff",
+    "actionable"
+  ],
+  "additionalProperties": false
+}
